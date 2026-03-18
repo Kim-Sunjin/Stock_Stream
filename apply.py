@@ -7,12 +7,14 @@ from plotly.subplots import make_subplots
 st.set_page_config(page_title="My Portfolio Dashboard", layout="wide")
 st.title("📈 나의 주식 포트폴리오 대시보드 (원/달러 통합형)")
 
-# --- [함수] 한국 주식 완벽 식별 ---
+# ==========================================
+# 1. 모든 함수는 최상단에 독립적으로 선언합니다.
+# ==========================================
+
 def is_korean_stock(ticker):
     t = str(ticker).strip().upper()
     return t.endswith(('.KS', '.KQ', '.KR')) or t.replace('.KS', '').replace('.KQ', '').isdigit()
 
-# --- [함수] 티커를 종목명으로 변환 ---
 @st.cache_data(ttl=86400)
 def get_company_names(tickers):
     mapping = {}
@@ -25,13 +27,34 @@ def get_company_names(tickers):
             mapping[ticker] = ticker
     return mapping
 
-# --- [함수] API 액면분할 이벤트 수집 (주가 복원 전용) ---
+# [수정됨] 조건문 안에 있던 주가 수집 함수를 바깥으로 빼냈습니다.
+@st.cache_data(ttl=3600)
+def load_market_data(tickers, start):
+    query_tickers = [t + '.KS' if str(t).isdigit() else t for t in tickers]
+    stock_data = yf.download(query_tickers, start=start, progress=False)['Close']
+    if isinstance(stock_data, pd.Series):
+        stock_data = stock_data.to_frame(name=tickers[0])
+    else:
+        # 섞인 컬럼 이름을 원래 티커로 1:1 매칭 복구
+        rename_dict = {q: t for q, t in zip(query_tickers, tickers)}
+        stock_data = stock_data.rename(columns=rename_dict)
+        
+    fx_data = yf.download('KRW=X', start=start, progress=False)['Close']
+    if isinstance(fx_data, pd.DataFrame):
+        fx_data = fx_data.squeeze()
+        
+    if stock_data.index.tz is not None:
+        stock_data.index = stock_data.index.tz_localize(None)
+    if fx_data.index.tz is not None:
+        fx_data.index = fx_data.index.tz_localize(None)
+        
+    return stock_data, fx_data
+
 @st.cache_data(ttl=86400)
 def get_split_events(tickers, start_date):
     split_records = []
     for ticker in tickers:
         try:
-            # 야후 파이낸스는 한국 주식에 .KS가 필요하므로 검색 시에만 붙여줌
             query_ticker = ticker + '.KS' if str(ticker).isdigit() else ticker
             splits = yf.Ticker(query_ticker).splits
             
@@ -44,23 +67,17 @@ def get_split_events(tickers, start_date):
                     if ratio > 0 and ratio != 1.0:
                         split_records.append({
                             'Date': date.normalize(),
-                            'Ticker': ticker, # 원래 티커 이름으로 저장
-                            'Ratio': ratio    # 수량이 아니라 순수 '비율'로 저장
+                            'Ticker': ticker, 
+                            'Ratio': ratio    
                         })
         except Exception:
             continue
-    return pd.DataFrame(split_records) 
+    return pd.DataFrame(split_records)
 
-# --- [함수] 타임머신: 특정 일자 기준 포트폴리오 스냅샷 ---
-def get_portfolio_snapshot(df_trades, target_date, fx_series, name_mapping, market_data, df_splits):
+def get_portfolio_snapshot(df_trades, target_date, fx_series, name_mapping, market_data):
     target_date_pd = pd.to_datetime(target_date)
     
-    if not df_splits.empty:
-        df_combined = pd.concat([df_trades, df_splits], ignore_index=True)
-    else:
-        df_combined = df_trades.copy()
-        
-    df_combined = df_combined[df_combined['Date'] <= target_date_pd].copy()
+    df_combined = df_trades[df_trades['Date'] <= target_date_pd].copy()
     df_combined['SortOrder'] = df_combined['Type'].map({'Split': 1, 'Buy': 2, 'Sell': 3})
     df = df_combined.sort_values(['Date', 'SortOrder']).copy()
     
@@ -73,7 +90,6 @@ def get_portfolio_snapshot(df_trades, target_date, fx_series, name_mapping, mark
         price = row['Price']
         date = row['Date']
         
-        # [복구됨] 거래 당시의 환율을 적용하여 원화 단가로 변환합니다.
         fx_rate = fx_series.asof(date) if not pd.isna(fx_series.asof(date)) else 1300.0
         exchange_multiplier = 1 if is_korean_stock(ticker) else fx_rate
         price_krw = price * exchange_multiplier
@@ -129,13 +145,8 @@ def get_portfolio_snapshot(df_trades, target_date, fx_series, name_mapping, mark
             
     return pd.DataFrame(current_holdings)
 
-# --- [함수] 실현 수익 계산 ---
-def calculate_realized_profit(df_trades, fx_series, name_mapping, df_splits):
-    if not df_splits.empty:
-        df_combined = pd.concat([df_trades, df_splits], ignore_index=True)
-    else:
-        df_combined = df_trades.copy()
-        
+def calculate_realized_profit(df_trades, fx_series, name_mapping):
+    df_combined = df_trades.copy()
     df_combined['SortOrder'] = df_combined['Type'].map({'Split': 1, 'Buy': 2, 'Sell': 3})
     df = df_combined.sort_values(['Date', 'SortOrder']).copy()
     
@@ -149,7 +160,6 @@ def calculate_realized_profit(df_trades, fx_series, name_mapping, df_splits):
         price = row['Price']
         date = row['Date']
         
-        # [복구됨] 거래 당시의 환율을 적용하여 원화 단가로 변환합니다.
         fx_rate = fx_series.asof(date) if not pd.isna(fx_series.asof(date)) else 1300.0
         exchange_multiplier = 1 if is_korean_stock(ticker) else fx_rate
         price_krw = price * exchange_multiplier
@@ -189,15 +199,14 @@ def calculate_realized_profit(df_trades, fx_series, name_mapping, df_splits):
     return pd.DataFrame(realized_records)
 
 # ==========================================
-# 메인 어플리케이션 실행부
+# 2. 메인 어플리케이션 실행부
 # ==========================================
-st.sidebar.markdown("**[작성 규칙]**\n- 한국 주식: 원화(KRW) 입력\n- 미국 주식: 달러(USD) 입력")
+st.sidebar.markdown("**[작성 규칙]**\n- 한국 주식: 원화(KRW) 단가 입력\n- 미국 주식: 달러(USD) 단가 입력")
 uploaded_file = st.sidebar.file_uploader("매매 이력 CSV 파일을 업로드하세요", type=['csv'])
 
 if uploaded_file is not None:
     df_trade = pd.read_csv(uploaded_file)
     
-    # 데이터 정제 (띄어쓰기, 대소문자 오타 완벽 방어)
     df_trade['Date'] = pd.to_datetime(df_trade['Date'])
     df_trade['Qty'] = pd.to_numeric(df_trade['Qty'].astype(str).str.replace(',', '').str.strip())
     df_trade['Price'] = pd.to_numeric(df_trade['Price'].astype(str).str.replace(',', '').str.strip())
@@ -209,43 +218,19 @@ if uploaded_file is not None:
     all_dates = pd.date_range(start=start_date, end=end_date, freq='D')
     
     st.sidebar.success("데이터 로드 완료!")
-    
-    @st.cache_data(ttl=3600)
-    def load_market_data(tickers, start):
-        query_tickers = [t + '.KS' if str(t).isdigit() else t for t in tickers]
-        stock_data = yf.download(query_tickers, start=start, progress=False)['Close']
         
-        if isinstance(stock_data, pd.Series):
-            stock_data = stock_data.to_frame(name=tickers[0])
-        else:
-            # [버그 수정] 알파벳 순서로 섞인 컬럼을 정확히 1:1 매칭하여 원래 이름으로 복구
-            rename_dict = {q: t for q, t in zip(query_tickers, tickers)}
-            stock_data = stock_data.rename(columns=rename_dict)
-            
-        fx_data = yf.download('KRW=X', start=start, progress=False)['Close']
-        if isinstance(fx_data, pd.DataFrame):
-            fx_data = fx_data.squeeze()
-            
-        # 시차(Timezone) 에러 원천 차단
-        if stock_data.index.tz is not None:
-            stock_data.index = stock_data.index.tz_localize(None)
-        if fx_data.index.tz is not None:
-            fx_data.index = fx_data.index.tz_localize(None)
-            
-        return stock_data, fx_data
-        
-    with st.spinner("종목명, 주가, 환율 및 분할 데이터를 불러오는 중입니다..."):
+    with st.spinner("종목명, 주가 및 환율 데이터를 불러오는 중입니다..."):
         name_mapping = get_company_names(tickers)
-        market_data, fx_data = load_market_data(tickers, start_date)
+        # [안전장치] 캐시에서 꺼내올 때 .copy()를 사용하여 원본 오염을 완벽히 차단합니다.
+        market_data_raw, fx_data_raw = load_market_data(tickers, start_date)
+        market_data = market_data_raw.copy()
+        fx_data = fx_data_raw.copy()
+        
         df_splits = get_split_events(tickers, start_date) 
         
     market_data = market_data.reindex(all_dates).ffill().bfill()
     fx_data = fx_data.reindex(all_dates).ffill().bfill()
     
-    # ====================================================================
-    # --- [핵심 복원 로직] 야후 API 분할 정보를 이용해 '과거 실제 주가' 완벽 복원 ---
-    # ====================================================================
-    # 엑셀 기록과 무관하게, API가 알려주는 분할 비율을 역산하여 과거 주가를 되살립니다.
     if not df_splits.empty:
         for _, row in df_splits.iterrows():
             split_date = row['Date']
@@ -253,21 +238,10 @@ if uploaded_file is not None:
             ratio = row['Ratio']
             
             if ticker in market_data.columns:
-                # 분할일 '이전'의 모든 주가에 분할 비율을 곱해 깎이기 전 가격으로 복구
                 mask = market_data.index < split_date
                 market_data.loc[mask, ticker] *= ratio
-    # ====================================================================
 
-    # --- 투자 원금 및 수량 시뮬레이션 (API 분할 로직 완전 제거 유지) ---
-    df_all_events = df_trade.copy() # 내 엑셀 장부만 100% 신뢰하여 시뮬레이션
-    
-    # --- 투자 원금 및 수량 시뮬레이션 ---
-    manual_splits = df_trade[df_trade['Type'] == 'Split']
-    manual_tickers = manual_splits['Ticker'].unique()
-    if not df_splits.empty:
-        df_splits = df_splits[~df_splits['Ticker'].isin(manual_tickers)]
-
-    df_all_events = pd.concat([df_trade, df_splits], ignore_index=True)
+    df_all_events = df_trade.copy()
     df_all_events['SortOrder'] = df_all_events['Type'].map({'Split': 1, 'Buy': 2, 'Sell': 3})
     df_all_events = df_all_events.sort_values(['Date', 'SortOrder'])
 
@@ -285,7 +259,6 @@ if uploaded_file is not None:
             qty = row['Qty']
             price = row['Price']
             
-            # [복구됨] 거래 당시의 환율을 적용하여 원화 단가로 변환합니다.
             fx_rate = fx_data.asof(row['Date']) if not pd.isna(fx_data.asof(row['Date'])) else 1300.0
             exchange_multiplier = 1 if is_korean_stock(ticker) else fx_rate
             price_krw = price * exchange_multiplier
@@ -350,7 +323,6 @@ if uploaded_file is not None:
     
     st.divider()
 
-    # --- 5. 일자별 자산 그래프 ---
     st.subheader("📊 일자별 자산 및 수익률 추이")
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     
@@ -363,6 +335,59 @@ if uploaded_file is not None:
     fig.update_yaxes(title_text="수익률 (%)", secondary_y=True)
     st.plotly_chart(fig, use_container_width=True)
     
+    # (기존 코드) st.plotly_chart(fig, use_container_width=True) 바로 아래에 추가하세요.
+    
+    # ====================================================================
+    # --- 6. 연도별 투자 성과 요약 ---
+    # ==========================================
+    st.divider()
+    st.subheader("📅 연도별 투자 성과 요약")
+    
+    # 1. 매년 마지막 거래일의 데이터만 추출
+    result_df_copy = result_df.copy()
+    result_df_copy['Year'] = result_df_copy.index.year
+    df_yearly = result_df_copy.drop_duplicates(subset=['Year'], keep='last').copy()
+    df_yearly.set_index('Year', inplace=True)
+    
+    # 2. 전년도 말 기준 자산 및 원금 세팅 (계산용)
+    df_yearly['Prev_Asset'] = df_yearly['Total_Asset'].shift(1).fillna(0)
+    df_yearly['Prev_Invested'] = df_yearly['Invested_Principal'].shift(1).fillna(0)
+    
+    # 3. 해당 연도의 순수익 및 수익률 계산
+    df_yearly['Net_Invested_This_Year'] = df_yearly['Invested_Principal'] - df_yearly['Prev_Invested']
+    df_yearly['Profit_This_Year'] = df_yearly['Total_Asset'] - df_yearly['Prev_Asset'] - df_yearly['Net_Invested_This_Year']
+    
+    # 연간 수익률 = 당해 연도 순수익금 / (작년 말 자산 + 올해 순투자액) * 100
+    base_capital = df_yearly['Prev_Asset'] + df_yearly['Net_Invested_This_Year']
+    
+    # 분모가 0인 경우(투자금 0) 에러 방지
+    df_yearly['Annual_Return_Rate'] = 0.0
+    valid_idx = base_capital > 0
+    df_yearly.loc[valid_idx, 'Annual_Return_Rate'] = (df_yearly.loc[valid_idx, 'Profit_This_Year'] / base_capital.loc[valid_idx]) * 100
+
+    # 4. 출력용 데이터 프레임 정리
+    display_yearly = pd.DataFrame({
+        '연말 평가 자산(KRW)': df_yearly['Total_Asset'],
+        '연간 순투자액(KRW)': df_yearly['Net_Invested_This_Year'],
+        '연간 순수익금(KRW)': df_yearly['Profit_This_Year'],
+        '연간 수익률(%)': df_yearly['Annual_Return_Rate'],
+        '누적 수익률(%)': df_yearly['Return_Rate']
+    })
+    
+    styled_yearly = display_yearly.style.format({
+        '연말 평가 자산(KRW)': '{:,.0f} 원',
+        '연간 순투자액(KRW)': '{:,.0f} 원',
+        '연간 순수익금(KRW)': '{:,.0f} 원',
+        '연간 수익률(%)': '{:,.2f}%',
+        '누적 수익률(%)': '{:,.2f}%'
+    })
+    
+    # 표 상단에 간단한 설명 추가
+    st.markdown("매년 말 기준의 자산 현황과 **해당 연도에 새롭게 발생한 수익 및 수익률**을 보여줍니다.")
+    st.dataframe(styled_yearly, use_container_width=True)
+    # ====================================================================
+
+
     st.divider()
     st.subheader("⏱️ 타임머신: 특정 일자의 포트폴리오 엿보기")
     
@@ -377,7 +402,7 @@ if uploaded_file is not None:
         format="YYYY-MM-DD"
     )
     
-    df_snapshot = get_portfolio_snapshot(df_trade, selected_date, fx_data, name_mapping, market_data, df_splits)
+    df_snapshot = get_portfolio_snapshot(df_trade, selected_date, fx_data, name_mapping, market_data)
     
     col_pie, col_summary = st.columns([1, 1])
     
@@ -421,7 +446,7 @@ if uploaded_file is not None:
     st.divider()
     st.subheader("💰 종목별 실현 수익 (매도 내역)")
     
-    df_realized = calculate_realized_profit(df_trade, fx_data, name_mapping, df_splits)
+    df_realized = calculate_realized_profit(df_trade, fx_data, name_mapping)
     
     if not df_realized.empty:
         styled_df = df_realized.style.format({

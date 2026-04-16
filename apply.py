@@ -15,7 +15,6 @@ def is_korean_stock(ticker):
     t = str(ticker).strip().upper()
     return t.endswith(('.KS', '.KQ', '.KR')) or t.replace('.KS', '').replace('.KQ', '').isdigit()
 
-# [수정됨] 나만의 종목 사전 제외, 순수 야후 파이낸스 검색 로직으로 원복 (한국 주식 .KS 방어 로직만 유지)
 @st.cache_data(ttl=86400)
 def get_company_names(tickers):
     mapping = {}
@@ -32,16 +31,16 @@ def get_company_names(tickers):
 @st.cache_data(ttl=3600)
 def load_market_data(tickers, start):
     query_tickers = [t + '.KS' if str(t).isdigit() else t for t in tickers]
-    stock_data = yf.download(query_tickers, start=start, progress=False)['Close']
+    # [방어 1] auto_adjust=False로 yfinance 내부 ZeroDivisionError 원천 차단
+    stock_data = yf.download(query_tickers, start=start, progress=False, auto_adjust=False)['Close']
     
     if isinstance(stock_data, pd.Series):
         stock_data = stock_data.to_frame(name=tickers[0])
     else:
-        # 섞인 컬럼 이름을 원래 티커로 1:1 매칭 복구
         rename_dict = {q: t for q, t in zip(query_tickers, tickers)}
         stock_data = stock_data.rename(columns=rename_dict)
         
-    fx_data = yf.download('KRW=X', start=start, progress=False)['Close']
+    fx_data = yf.download('KRW=X', start=start, progress=False, auto_adjust=False)['Close']
     if isinstance(fx_data, pd.DataFrame):
         fx_data = fx_data.squeeze()
         
@@ -92,7 +91,11 @@ def get_portfolio_snapshot(df_trades, target_date, fx_series, name_mapping, mark
         price = row['Price']
         date = row['Date']
         
-        fx_rate = fx_series.asof(date) if not pd.isna(fx_series.asof(date)) else 1300.0
+        # [방어 2] 환율이 0이하로 떨어지는 오류 방어
+        fx_rate = fx_series.asof(date)
+        if pd.isna(fx_rate) or fx_rate <= 0:
+            fx_rate = 1300.0
+            
         exchange_multiplier = 1 if is_korean_stock(ticker) else fx_rate
         price_krw = price * exchange_multiplier
         
@@ -102,7 +105,7 @@ def get_portfolio_snapshot(df_trades, target_date, fx_series, name_mapping, mark
         pos = portfolio[ticker]
         
         if t_type == 'Split':
-            if pos['qty'] > 0:
+            if pos['qty'] > 0 and qty > 0: # 분할 비율 0 방어
                 pos['qty'] *= qty           
                 pos['avg_cost_krw'] /= qty  
 
@@ -122,7 +125,10 @@ def get_portfolio_snapshot(df_trades, target_date, fx_series, name_mapping, mark
                     pos['total_cost_krw'] = 0.0
                     
     target_prices = market_data.loc[target_date_pd] if target_date_pd in market_data.index else market_data.asof(target_date_pd)
-    target_fx = fx_series.asof(target_date_pd) if not pd.isna(fx_series.asof(target_date_pd)) else 1300.0
+    
+    target_fx = fx_series.asof(target_date_pd)
+    if pd.isna(target_fx) or target_fx <= 0:
+        target_fx = 1300.0
 
     current_holdings = []
     for ticker, pos in portfolio.items():
@@ -162,7 +168,10 @@ def calculate_realized_profit(df_trades, fx_series, name_mapping):
         price = row['Price']
         date = row['Date']
         
-        fx_rate = fx_series.asof(date) if not pd.isna(fx_series.asof(date)) else 1300.0
+        fx_rate = fx_series.asof(date)
+        if pd.isna(fx_rate) or fx_rate <= 0:
+            fx_rate = 1300.0
+            
         exchange_multiplier = 1 if is_korean_stock(ticker) else fx_rate
         price_krw = price * exchange_multiplier
         
@@ -172,7 +181,7 @@ def calculate_realized_profit(df_trades, fx_series, name_mapping):
         pos = portfolio[ticker]
 
         if t_type == 'Split':
-            if pos['qty'] > 0:
+            if pos['qty'] > 0 and qty > 0:
                 pos['qty'] *= qty           
                 pos['avg_cost_krw'] /= qty  
 
@@ -185,7 +194,11 @@ def calculate_realized_profit(df_trades, fx_series, name_mapping):
         elif t_type == 'Sell':
             if pos['qty'] > 0:
                 profit_krw = (price_krw - pos['avg_cost_krw']) * qty
-                profit_rate = ((price_krw - pos['avg_cost_krw']) / pos['avg_cost_krw']) * 100
+                # [방어 3] 매수 평단가가 0원일 경우 발생하는 순수 파이썬 ZeroDivisionError 방어
+                if pos['avg_cost_krw'] > 0:
+                    profit_rate = ((price_krw - pos['avg_cost_krw']) / pos['avg_cost_krw']) * 100
+                else:
+                    profit_rate = 0.0
                 
                 realized_records.append({
                     '매도 일자': date.date(),
@@ -209,7 +222,6 @@ uploaded_file = st.sidebar.file_uploader("매매 이력 CSV 파일을 업로드�
 if uploaded_file is not None:
     df_trade = pd.read_csv(uploaded_file)
     
-    # 데이터 정제
     df_trade['Date'] = pd.to_datetime(df_trade['Date'])
     df_trade['Qty'] = pd.to_numeric(df_trade['Qty'].astype(str).str.replace(',', '').str.strip())
     df_trade['Price'] = pd.to_numeric(df_trade['Price'].astype(str).str.replace(',', '').str.strip())
@@ -233,7 +245,6 @@ if uploaded_file is not None:
     market_data = market_data.reindex(all_dates).ffill().bfill()
     fx_data = fx_data.reindex(all_dates).ffill().bfill()
     
-    # API 분할 정보로 과거 실제 주가 복원
     if not df_splits.empty:
         for _, row in df_splits.iterrows():
             split_date = row['Date']
@@ -244,13 +255,9 @@ if uploaded_file is not None:
                 mask = market_data.index < split_date
                 market_data.loc[mask, ticker] *= ratio
 
-    # ====================================================================
-    # --- 🔍 [추가됨] 개별 종목 기술적 분석 섹션 ---
-    # ====================================================================
     st.divider()
     st.subheader("🔍 보유 종목 기술적 분석 (RSI, 볼린저 밴드, 이동평균선)")
     
-    # 사이드바에서 분석할 종목 선택
     selected_tech_ticker = st.sidebar.selectbox(
         "기술적 분석 종목 선택",
         options=tickers,
@@ -259,16 +266,13 @@ if uploaded_file is not None:
     
     tech_name = name_mapping.get(selected_tech_ticker, selected_tech_ticker)
     
-    # yfinance에서 OHLC(고가/저가/시가/종가) 데이터를 추가로 불러옵니다.
     q_ticker = str(selected_tech_ticker) + '.KS' if str(selected_tech_ticker).isdigit() else selected_tech_ticker
-    ohlc_data = yf.download(q_ticker, start=start_date, progress=False).copy()
+    ohlc_data = yf.download(q_ticker, start=start_date, progress=False, auto_adjust=False).copy()
     
-    # yfinance 최신 버전 다중 인덱스 방어
     if isinstance(ohlc_data.columns, pd.MultiIndex):
         ohlc_data.columns = ohlc_data.columns.droplevel(1)
         
     if not ohlc_data.empty:
-        # 기술적 지표 계산 (Pandas 롤링 기능)
         ohlc_data['SMA20'] = ohlc_data['Close'].rolling(window=20).mean()
         ohlc_data['SMA60'] = ohlc_data['Close'].rolling(window=60).mean()
         
@@ -282,23 +286,19 @@ if uploaded_file is not None:
         rs = gain / loss
         ohlc_data['RSI'] = 100 - (100 / (1 + rs))
 
-        # 차트 그리기
         st.markdown(f"**[{tech_name}] 일봉 차트 및 지표**")
         fig_tech = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
         
-        # 캔들스틱
         fig_tech.add_trace(go.Candlestick(
             x=ohlc_data.index, open=ohlc_data['Open'], high=ohlc_data['High'],
             low=ohlc_data['Low'], close=ohlc_data['Close'], name='Price'
         ), row=1, col=1)
         
-        # 이동평균 및 볼린저 밴드
         fig_tech.add_trace(go.Scatter(x=ohlc_data.index, y=ohlc_data['BB_Upper'], name='BB 상단', line=dict(color='rgba(255, 165, 0, 0.6)', width=1)), row=1, col=1)
         fig_tech.add_trace(go.Scatter(x=ohlc_data.index, y=ohlc_data['BB_Lower'], name='BB 하단', line=dict(color='rgba(255, 165, 0, 0.6)', width=1), fill='tonexty', fillcolor='rgba(255, 165, 0, 0.1)'), row=1, col=1)
         fig_tech.add_trace(go.Scatter(x=ohlc_data.index, y=ohlc_data['SMA20'], name='20일선', line=dict(color='blue', width=1.5)), row=1, col=1)
         fig_tech.add_trace(go.Scatter(x=ohlc_data.index, y=ohlc_data['SMA60'], name='60일선', line=dict(color='green', width=1.5)), row=1, col=1)
         
-        # RSI
         fig_tech.add_trace(go.Scatter(x=ohlc_data.index, y=ohlc_data['RSI'], name='RSI', line=dict(color='purple', width=2)), row=2, col=1)
         fig_tech.add_hline(y=70, line=dict(color='red', width=1, dash='dot'), row=2, col=1)
         fig_tech.add_hline(y=30, line=dict(color='green', width=1, dash='dot'), row=2, col=1)
@@ -310,9 +310,6 @@ if uploaded_file is not None:
     else:
         st.warning(f"'{tech_name}'의 차트 데이터를 불러오지 못했습니다.")
 
-    # ====================================================================
-    # --- 포트폴리오 시뮬레이션 및 요약 ---
-    # ====================================================================
     df_all_events = df_trade.copy()
     df_all_events['SortOrder'] = df_all_events['Type'].map({'Split': 1, 'Buy': 2, 'Sell': 3})
     df_all_events = df_all_events.sort_values(['Date', 'SortOrder'])
@@ -331,14 +328,17 @@ if uploaded_file is not None:
             qty = row['Qty']
             price = row['Price']
             
-            fx_rate = fx_data.asof(row['Date']) if not pd.isna(fx_data.asof(row['Date'])) else 1300.0
+            fx_rate = fx_data.asof(row['Date'])
+            if pd.isna(fx_rate) or fx_rate <= 0:
+                fx_rate = 1300.0
+                
             exchange_multiplier = 1 if is_korean_stock(ticker) else fx_rate
             price_krw = price * exchange_multiplier
             
             pos = portfolio[ticker]
             
             if t_type == 'Split':
-                if pos['qty'] > 0:
+                if pos['qty'] > 0 and qty > 0:
                     pos['qty'] *= qty
                     pos['avg_cost_krw'] /= qty 
             elif t_type == 'Buy':
@@ -382,7 +382,6 @@ if uploaded_file is not None:
     
     result_df['Return_Rate'] = ((result_df['Total_Asset'] - result_df['Invested_Principal']) / result_df['Invested_Principal'] * 100).fillna(0)
 
-    # --- 상단 요약 지표 ---
     st.divider()
     st.subheader("💼 전체 포트폴리오 요약")
     current_asset = result_df['Total_Asset'].iloc[-1]
@@ -409,9 +408,6 @@ if uploaded_file is not None:
     fig.update_yaxes(title_text="수익률 (%)", secondary_y=True)
     st.plotly_chart(fig, use_container_width=True)
 
-    # ====================================================================
-    # --- [추가됨] 연도별 투자 성과 요약 ---
-    # ====================================================================
     st.divider()
     st.subheader("📅 연도별 투자 성과 요약")
     
@@ -449,8 +445,6 @@ if uploaded_file is not None:
     
     st.markdown("매년 말 기준의 자산 현황과 해당 연도에 새롭게 투입된 원금 대비 발생한 순수익률입니다.")
     st.dataframe(styled_yearly, use_container_width=True)
-    
-    # ====================================================================
     
     st.divider()
     st.subheader("⏱️ 타임머신: 특정 일자의 포트폴리오 엿보기")
